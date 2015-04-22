@@ -1,0 +1,603 @@
+#!/usr/bin/php -q
+<?php 
+/** 
+ * Author: Dan Shumaker
+ * Date: 10/1/2012
+ * Updated: 1/3/2014 : Moved Command line options to seperate files with classes.
+ * Updated: 12/3/2014 : Added local and remote database command line options in the event you need to have differently named databases.
+ */
+
+$help = 'Drupal Database Backups:  It pushs and pulls from remote mysql servers as well as does backups of local and remote mysql databases.';
+
+date_default_timezone_set("America/Los_Angeles");
+
+require_once dirname(__FILE__) . '/cli_settings.php';
+
+/**
+  Requirements: 
+    mysqldump on local and remote servers.
+    ssh keys installed with passwordless installed
+    php/mysql 5.1.* with NO .my.cnf defaults ***
+    Local and remote databases being named the same.  Can have different users
+    scp command available
+
+  Remote backups can be done a number of ways.  Drush has an sync.  Mysql has the the host option.  However both of these
+  options proved very slow in the current network setup. Thus sending commands via ssh proved to be the fastest
+  method and so that's what is implemented here. This is the method.  send mysqldump command over ssh and pipe to a local file.  gzip the file. scp file the back to local server. Unzip the file, mysql < load it.
+ 	
+  When performing backups (ie mysqldumps) the names of the output files are not customizable and default to 
+  being named with the $host_$database_$timestamp.{sql,err} format.
+
+  For example: Here are two files that are output.
+
+    localhost_dentegra_dev_Jan_08_2013_5_05_57.sql
+    localhost_dentegra_dev_Jan_08_2013_5_05_57.err
+
+  Command Line options:
+
+    // Options 
+     verbose   Print debugging output
+     tbx       Set the list of tables to exclude from the backup.   NOTE: The schemas are dumped but the actual data is not.
+               Here is the default list if this option is not specified:  sessions,accesslog,cache,cache_form,cache_apachesolr,cache_block,cache_content,cache_filter,cache_menu,cache_page,cache_update,history,search_index,search_dataset,search_total,search_node_links,webform_submitted_data,notifications,notifications_event,notifications_queue,notifications_fields,notifications_sent,watchdog');
+
+     tb        A table to backup: Use this if you only need to create a backup of one file.
+     createdb  Include the "CREATE database" mysqlcommand in the output file. NOTE: Sometimes the rmuser does NOT have permission to do this.
+     dropdb    Include the "drop database" mysqlcommand in the output file. NOTE: Sometimes the rmuser does NOT have permission to do this.
+     latest    Create a sym link called latest in the storage directory. This is simply for convenience.
+     usedb     Include the "USE database" mysqlcommand in the output file. 
+     fkeys     Set the FOREIGN_KEY_CHECKS environment variable before the mysqldump command. 
+     no_ssh    For pantheon that doesn't allow ssh access you need to turn on this flag -- The assumption that is that mysqldumps will be done locally and stdout redirected to a file.
+
+    // Local Settings 
+     lmuser    local mysql username
+     lmpass    local mysql password to use
+     ldb       local database name
+     host'     hostname of the local host
+     storage   directory to store the database dumps in
+     lpulldir  directory to store the pulled database dumps in.
+
+    // Remote Settings 
+     rmuser    Set the remote mysql username
+     rmpass    Set the remote mysql password
+     rdb
+     ruser     Set the remote ssh username
+     rhost     Set the remote hostname to ssh to.
+     rmhost    Set the remote hostname of the mysql server.
+     rstorage  Set the directory that ddbb will use to put it's database dumps in.
+     rpushdir  Set the directory that ddbb will push database dumps to.
+
+    // Commands 
+     lb       Perform a local backup
+     rb       Perform a remote backup
+     push     Push a local backup to the remote server and load the backup into the remote mysql server.
+     pull     Copy the remote backup from the remote server to the local server and load it into the mysql server.
+     s       Save all the options, local settings, and remote settings into a serialized array file with this name.  
+     l       Load all the saved options from this serialized array file.
+     p       Print out all the available options with an example.
+
+
+NOTES:
+
+* Before doing a push or pull both remote and local databases are backed up automatically for safety reasons.
+  Therefore you do not have to do lb or rb commands in addition to pushing and pulling..
+* 
+
+* All options need a double dash that should preceed them.
+
+* All option values need an equal sign infront of them. 
+
+* Commands do not take values.
+
+Typical usage:
+
+ddbb --l=dt.ddbb --lb      Load the settings from the dt.ddbb file and perform a local backup
+
+ddbb --l=dt.ddbb --rb      Load the settings from the dt.ddbb file and perform a remote backup
+
+ddbb --l=dt.ddbb --push    Load the settings from the dt.ddbb file and push the local database to remote database server.
+                            For example, if executed locally your local machine is your development machine 
+                            and your remote machine is your production machine then this would be pushing the database
+                            from your dev to your prod machine.
+
+ddbb --l=dt.ddbb --pull     Perform a local and remote backup, and then copy the remote backuped up database
+                            to your local machine and load that database dump into your local mysql server.
+
+
+ddbb --p                    Print all options with an example.   Here is a sample output of this command:
+
+
+
+*/
+
+class StopWatch { 
+    public $total; 
+    public $time; 
+    
+    public function __construct() { 
+        $this->total = $this->time = microtime(true); 
+    } 
+    
+    public function clock() { 
+        return -$this->time + ($this->time = microtime(true)); 
+    } 
+    
+    public function elapsed() { 
+        return microtime(true) - $this->total; 
+    } 
+    
+    public function reset() { 
+        $this->total=$this->time=microtime(true); 
+    } 
+} 
+
+class Tio {
+  // If wanted pretty output to the browser then I'd use krumo:  http://krumo.sourceforge.net/
+  // But I want terminal and file output.
+  public $prompt = FALSE;
+  public $verbose = FALSE;
+  public $timing = FALSE;
+  public $db;
+  public $file = FALSE;
+  public $start_time;
+  function __construct() {
+    $this->start_time = new StopWatch();
+  }
+
+  // Print the command to file or if its an error
+  // print with a prompt if necessary
+  // print verbosely if necessary
+  public function p($str, $prompt=FALSE, $error=FALSE) {
+    if (is_array($str) && $this->verbose ) {
+      if ($this->file) {
+        if (is_string($this->file)) {
+          $this->file = fopen($this->file, 'w') or die('failed to open file') ;
+        }
+        ob_start();
+        var_dump($str);
+        $result = ob_get_clean();
+        fwrite($this->file, $result);
+      } else {
+        print_r($str);
+      }
+    }
+    if ($this->prompt || $prompt) {
+      $this->check_results($str);
+    }
+    if ($this->verbose || $error ) {
+      if ($this->file) {
+        if (is_string($this->file)) {
+          $this->file = fopen($this->file, 'w') or die('failed to open file') ;
+        }
+        fwrite($this->file, $str);
+      } else {
+        print $str . "\n";
+      }
+    }
+  }
+  // print timing of the command
+  function pt($start=0) {
+    if ($this->timing) {
+      if ($start === 1) {
+        $this->start_time->reset();
+      } 
+      if ($this->start_time->elapsed() > 60) {
+        $elapsed = $this->start_time->elapsed() / 60;
+        $estr = round($elapsed,2) . " minutes ";
+      } else {
+        $estr = round($this->start_time->elapsed(),2) . " seconds ";
+      }
+      print date("g:i:s A D, F jS Y",time()) . " Elapsed: " . $estr . "\n";
+    }
+  }
+  /**
+   * Blocking command execution
+   */
+  public function cmd($command) {
+      print $command . "\n";
+      $process = popen($command, 'r');
+      $reading = true;
+      while( $reading ) {
+        $reading = fread($process, 256*256); 
+        print $reading . "\n";
+      }
+      pclose($process);
+  }
+
+  public function ismake($dir) {
+    print $dir;
+    if (is_dir($dir)) {
+      return;
+    } else {
+        if (mkdir($dir, 0777, true)) {
+          return;
+        } else {
+          $this->p("Couldn't create directory ". $dir);
+          exit();
+        }
+    }
+  }
+}
+
+class ddbb {
+
+  function __construct($help) {
+    $this->cli = new CommandLineSettings($help);
+    $this->io = new Tio();
+  }
+
+  public function processargs($argv) {
+    // Options 
+    $this->cli->add_option( 'tbx', 'sessions,accesslog,cache,cache_form,cache_apachesolr,cache_block,cache_content,cache_filter,cache_menu,cache_page,cache_update,history,search_index,search_dataset,search_total,search_node_links,webform_submitted_data,notifications,notifications_event,notifications_queue,notifications_fields,notifications_sent,watchdog', true);
+    $this->cli->add_option( 'tb', false, true );
+    //$this->cli->add_option( 'createdb', false, true );
+    //$this->cli->add_option( 'dropdb', false, true );
+    $this->cli->add_option( 'latest', false, true );
+    //$this->cli->add_option( 'usedb', false, true );
+    $this->cli->add_option( 'fkeys', false, true );
+    $this->cli->add_option( 'gzip', false, true );
+
+    // Local Settings 
+    $this->cli->add_option( 'lmuser', 'root', true );
+    $this->cli->add_option( 'lmpass', 'tacoshop', true );
+    $this->cli->add_option( 'ldb', 'testdb', true );
+    $this->cli->add_option( 'host', 'localhost', true );
+    $this->cli->add_option( 'storage', '/data/backups/local', true );
+    $this->cli->add_option( 'lpulldir', '/data/backups/remote', true );
+
+    // Remote Settings 
+    $this->cli->add_option( 'rmuser', 'root', true );
+    $this->cli->add_option( 'rmpass', 'tacoshop', true );
+    $this->cli->add_option( 'rdb', 'testdb', true );
+    $this->cli->add_option( 'ruser', 'dshumaker', true );
+    $this->cli->add_option( 'rhost', '192.168.2.113', true );
+    $this->cli->add_option( 'rmhost', '192.168.2.74', true );
+    $this->cli->add_option( 'rstorage', '/home/dshumaker/backups/local', true );
+    $this->cli->add_option( 'rpushdir', '/home/dan/backups/laptop/', true );
+    $this->cli->add_option( 'no_ssh', false,true);
+    $this->cli->add_option( 'port', 3306,true); // Default port
+
+    // Commands 
+    $this->cli->add_option( 'lb', false, false );  // Local Backup
+    $this->cli->add_option( 'rb', false, false );  // Remote Backup
+    $this->cli->add_option( 'llp', false, false );   // Load Latest Pulled Remote Backup
+    $this->cli->add_option( 'lll', false, false );   // Load Latest Local Backup
+    $this->cli->add_option( 'push', false, false );
+    $this->cli->add_option( 'pull', false, false);
+
+    $this->cli->parseArgs($argv);
+
+    if ($this->cli->args['load']) {
+      $this->cli->load_settings();
+      // Add ability to override settings
+      foreach($argv as $key => $arg) {
+        if (substr($arg, 0, 7) == '--load=') {
+          unset($argv[$key]);
+          break;
+        }
+      }
+      $this->cli->parseArgs($argv);
+    }
+
+    if ($this->cli->args['save']) {
+      $this->io->ismake($this->cli->args['storage']);
+      $this->io->ismake($this->cli->args['lpulldir']);
+      if (!$this->cli->args['no_ssh']) {
+        $this->io->cmd('ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rstorage'] );
+        $this->io->cmd('ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rpushdir'] );
+      }
+      $this->cli->save_settings();
+      $this->cli->print_help();
+      exit();
+    }
+
+    if ($this->cli->args['print']) {
+      $this->cli->print_help();
+      exit();
+    }
+
+    if ($this->cli->args['lb']) {
+      $this->backup();
+    }
+
+    if ($this->cli->args['rb']) {
+      $this->backup(TRUE);
+    }
+
+    if ($this->cli->args['push']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      $this->backup(); //local
+      $this->backup(TRUE); //remote
+      $latest = realpath($this->cli->args['storage'] . '/latest');
+      chdir(dirname($latest));
+      if ($this->cli->args['gzip']) {
+        $this->io->cmd('tar -xvzf '. $latest);
+        $latest = substr($latest, 0, -7);
+      }
+      if (file_exists($latest)) {
+        if (!$this->cli->args['no_ssh']) {
+          $scp = 'scp '  . $latest . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'].':' . $this->cli->args['rpushdir'];
+          $this->io->cmd($scp);
+          $pushit = 'ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' "mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' ' . $this->cli->args['rdb'] . ' < ' . $this->cli->args['rpushdir'] .'/'. basename($latest) . '"';
+        } else {
+          $pushit = 'mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'] . ' ' .  $this->cli->args['rdb'] . ' < ' . $latest ;
+        }
+        $this->io->cmd($pushit);
+        $this->io->pt();
+        if ($this->cli->args['gzip']) {
+          $this->io->cmd('rm ' . $latest);
+        }
+      } else {
+        print "No latest file to get";
+      }
+    }
+    if ($this->cli->args['pull']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      $this->backup(); //local
+      $this->backup(TRUE); //remote
+      $this->loadlatest('pull');
+    }
+
+		if ($this->cli->args['llp']) {
+      $this->loadlatest('pull');
+    }
+		if ($this->cli->args['lll']) {
+      $this->loadlatest('local');
+    }
+
+  }
+
+  /*
+   * Load a database from the latest link that came from the pulled command or local backup command
+   */
+  public function loadlatest($source) {
+
+      if ($source === 'pull') {
+        $srcDir = $this->cli->args['lpulldir'];
+      }else {
+        $srcDir = $this->cli->args['storage'];
+      }
+      /**
+       * add this when removing createdb and dropdb and usedb flags 
+       mysql -e 'DROP DATABASE IF EXISTS beckerdev; CREATE DATABASE beckerdev'                                           
+       */
+      if ($this->cli->args['gzip']) {
+        chdir($srcDir);
+        $sql = readlink('latest');
+        $this->io->cmd('tar -xvzf ' . $sql);
+        $source = substr($sql,0, -7);
+        $pullit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' ' . $this->cli->args['ldb'] . ' < ' . $srcDir . '/' . $source ;
+        $this->io->cmd($pullit);
+        $this->io->cmd('rm '.  $source);
+      } else {
+        $pullit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' ' . $this->cli->args['ldb'] . ' < ' . $srcDir . '/latest' ;
+        $this->io->cmd($pullit);
+      }
+      $this->io->pt();
+  }
+
+  /*
+   * Main backup method 
+   */
+  public function backup($remote = 0) {
+
+    $db_tab = "";
+    $dt = date('M_d_Y_g_i_s');
+
+    if ($remote) {
+      // Remote
+      if ($this->cli->args['no_ssh']) {
+        $dest = $this->cli->args['lpulldir'];
+      } else {
+        $dest = $this->cli->args['rstorage'];
+      }
+      $err = $dest .'/'. $this->cli->args['rmhost'] . '_' . $this->cli->args['rdb'] . '_' .$dt . '.err';
+      $sql_file = $dest .'/'. $this->cli->args['rmhost'] . '_' . $this->cli->args['rdb'] . '_' .$dt . '.sql';
+      $ssh = 'ssh '. $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'];
+      if ($this->cli->args['fkeys']) {
+        $fkeys = 'echo \"SET FOREIGN_KEY_CHECKS=0;\" > ' . $sql_file . ';';
+      } else {
+        $fkeys = '';
+      }
+
+      if ($this->cli->args['no_ssh']) {
+        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'];
+      } else {
+        $start = $ssh . ' "' . $fkeys . 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=\"' . $this->cli->args['rmpass'] . '\" --host=' . $this->cli->args['rmhost'];
+      }
+      $db_tab = $this->cli->args['rdb'];
+    } else {
+      $dest = $this->cli->args['storage'];
+      $start = 'mysqldump --user=' . $this->cli->args['lmuser'] . ' --password="' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'];
+      $err = $dest .'/'. $this->cli->args['host'] . '_' . $this->cli->args['ldb'] . '_' .$dt . '.err';
+      $sql_file = $dest .'/'. $this->cli->args['host'] . '_' . $this->cli->args['ldb'] . '_' .$dt . '.sql';
+      $db_tab = $this->cli->args['ldb'];
+    }
+
+    /** 
+       You would hope that -Y would record/dump the table schema's regardless of the --ignore-table but not so.  So still need the -d schema dump method.
+
+       Use to use the mysql40 option for escaped strings like this: $options="--skip-opt --compact --add-drop-table -a -q --quote-names --compatible=mysql40 -d ";
+    
+       However, taking out the compatible=mysql40 because Acquia is using mysql5.5 which uses the Engine=InnoDB sytnax instead of the Type=InnoDB syntax on table creation.
+
+       This will most likely bite me because the reason I added the compatible=mysql40 option was because of the dev servers on TM wouldn't import the databases properly when it came to escaped strings.
+       So a push to acquia will probably work but a push to TM dev will probably fail.
+
+       -d   No Data (this is for the schemas
+       -q   quick output
+       -c   complete insert
+       -K   disable keys
+       --single-transaction  dumps all data in single insert statement --works better for some escaped charaters for drupal views for some reason.
+    */
+    $options="-qcK --single-transaction -d ";
+
+    /* Taking out usedb, createdb, and dropdb because it locks you into a database name choice.
+     * Since adding the ldb and rdb options we have to take these out.
+     
+    if ($this->cli->args['usedb']) {
+      $options .= ' -B ';  //The only way to get 'USE db_name;' included in the output.
+    }
+
+    if (!$this->cli->args['createdb']) {
+      $options .= ' -n ';
+    }
+
+    if ($this->cli->args['dropdb']) {
+      $options .= ' --add-drop-database ';
+    }
+
+     */
+
+
+    if ($this->cli->args['tb']) {
+      $db_tab = ' --tables '. $db_tab .' '. str_replace(',',' ',$this->cli->args['tb']);
+      $this->cli->args['tbx'] = '';
+    }
+
+    if ($this->cli->args['debug'] == TRUE) {
+      $options .= ' --extended-insert=FALSE --compact ';
+      $options = str_replace('-qcK', '-qK', $options);
+    }
+
+    $cmd = $start.' '.$options.' '.$db_tab ; 
+
+    $descriptorspec = array(
+      1 => array("file", $sql_file, "w"),  // stdout is a pipe that the child will write to
+      2 => array("file", $err, "w") // stderr is a file to write to
+    );
+
+    if ($remote) {
+      if ($this->cli->args['fkeys']) {
+        if (!$this->cli->args['no_ssh']) {
+          $cmd = $cmd .' >> ' . $sql_file . '"';
+        } else {
+          $cmd = $cmd .' >> ' . $sql_file ;
+        }
+      }else {
+        if (!$this->cli->args['no_ssh']) {
+          $cmd = $cmd .' > ' . $sql_file . '"';
+        } else {
+          $cmd = $cmd .' > ' . $sql_file;
+        }
+      }
+      $this->io->cmd($cmd);
+    } else {
+      if ($this->cli->args['fkeys']) {
+        $fkeys = 'echo "SET FOREIGN_KEY_CHECKS=0;" > ' . $sql_file;
+        $cmd = $fkeys . ';' . $cmd .' >> '.$sql_file;
+        $this->io->p( $cmd, false, true);
+      } else {
+        $this->io->p($cmd .' > '.$sql_file, false, true);
+      }
+      $process = proc_open($cmd, $descriptorspec, $pipes, $this->cli->args['storage'] );
+      if (is_resource($process)) {
+          $return_value = proc_close($process);
+      }
+      if ($return_value !== 0) {
+        $errors = file_get_contents($err);
+        print $errors;
+      }
+    }
+
+    if (!$this->cli->args['debug']) {
+      if ($remote) {
+        foreach(explode(',',$this->cli->args['tbx']) as $table) { $options .= ' --ignore-table=' . $this->cli->args['rdb'] . '.' .$table; }
+      } else {
+        foreach(explode(',',$this->cli->args['tbx']) as $table) { $options .= ' --ignore-table=' . $this->cli->args['ldb'] . '.' .$table; }
+      }
+
+    }
+
+    if ($remote) {
+      if (!$this->cli->args['no_ssh']) {
+        $start = $ssh . ' "mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=\"' . $this->cli->args['rmpass'] . '\" --host=' . $this->cli->args['rmhost'];
+      } else {
+        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'];
+      }
+    }
+
+    $cmd = $start.' '.$options.' '.$db_tab ; 
+    /*
+      
+     Take out the no data -d flag and replace with these flags so that all you get are insert statements
+
+     -y no tablespaces
+     -t no create table statements 
+     -n  no create database
+
+     */
+     
+    $cmd = str_replace(' -d ', ' -y -t -n ', $cmd);
+
+    if ($remote) {
+      if (!$this->cli->args['no_ssh']) {
+        $cmd = $cmd .' >> ' . $sql_file . '"';
+      } else {
+        $cmd = $cmd .' >> ' . $sql_file ;
+      }
+      $this->io->cmd($cmd);
+
+      if (!$this->cli->args['no_ssh']) {
+        $this->io->cmd('scp ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ':' . $sql_file . ' ' . $this->cli->args['lpulldir']);
+      } 
+      chdir($this->cli->args['lpulldir']);
+      // Gzip
+      if ($this->cli->args['gzip'] && !$this->cli->args['debug']) {
+        $cmd = 'tar -cvzf ' . basename($sql_file) .'.tar.gz ' . basename($sql_file);
+        $this->io->cmd($cmd);
+        $this->io->cmd('rm ' . basename($sql_file));
+        $sql_file = $sql_file . '.tar.gz';
+      }
+      if ($this->cli->args['latest']) {
+        if (is_link('latest')) {
+          unlink('latest'); 
+        }
+        symlink(basename($sql_file), 'latest');
+      }
+    } else {
+        $this->io->p($cmd .' >> '.$sql_file, false,true);
+
+      $descriptorspec = array(
+        1 => array("file", $sql_file, "a"),  // stdout is a pipe that the child will write to
+        2 => array("file", $err, "a") // stderr is a file to write to
+      );
+      $process = proc_open($cmd, $descriptorspec, $pipes, $this->cli->args['storage'] );
+
+      if (is_resource($process)) {
+          $return_value = proc_close($process);
+      }
+
+      if ($return_value !== 0) {
+        $errors = file_get_contents($err);
+        print $errors;
+      }
+      chdir($dest);
+
+      // Gzip
+      if ($this->cli->args['gzip'] && !$this->cli->args['debug']) {
+        $cmd = 'tar -cvzf ' . basename($sql_file) .'.tar.gz ' . basename($sql_file);
+        $this->io->cmd($cmd);
+        $this->io->cmd('rm ' . $sql_file);
+        $sql_file = $sql_file . '.tar.gz';
+      }
+
+      if ($this->cli->args['latest']) {
+        if (is_link('latest')) {
+          unlink('latest'); 
+        }
+        symlink(str_replace($dest . '/','', $sql_file), 'latest');
+      }
+    }
+  }
+}
+
+/**
+ * MAIN  -- how quaint to mention main() -- all the good ole days of c programming
+ */
+
+$main = new ddbb($help);
+$main->processargs($argv);
+
+?>
