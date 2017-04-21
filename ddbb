@@ -2,112 +2,154 @@
 <?php 
 /** 
  * Author: Dan Shumaker
- * Date: 10/1/2012
+ * Created: 10/1/2012
  * Updated: 1/3/2014 : Moved Command line options to seperate files with classes.
  * Updated: 12/3/2014 : Added local and remote database command line options in the event you need to have differently named databases.
+ * Updated: 12/7/2015 : Imported old required files cli.php and cli_settings.php to make this script/program
+ * Updated: 8/26/2016 : Added ssh port
+ *
+ * totally self-sufficient & independant of other files. Makes it easier to move from machine to machine.
+ * Updated: 2/04/2017 : Added -dbfile cli option
  */
 
 $help = 'Drupal Database Backups:  It pushs and pulls from remote mysql servers as well as does backups of local and remote mysql databases.';
 
 date_default_timezone_set("America/Los_Angeles");
 
-require_once dirname(__FILE__) . '/cli_settings.php';
+class CommandLine {
 
-/**
-  Requirements: 
-    mysqldump on local and remote servers.
-    ssh keys installed with passwordless installed
-    php/mysql 5.1.* with NO .my.cnf defaults ***
-    Local and remote databases being named the same.  Can have different users
-    scp command available
+    public $args = array();
+    public $script_name = '';
+    public $help_docs = '';
 
-  Remote backups can be done a number of ways.  Drush has an sync.  Mysql has the the host option.  However both of these
-  options proved very slow in the current network setup. Thus sending commands via ssh proved to be the fastest
-  method and so that's what is implemented here. This is the method.  send mysqldump command over ssh and pipe to a local file.  gzip the file. scp file the back to local server. Unzip the file, mysql < load it.
- 	
-  When performing backups (ie mysqldumps) the names of the output files are not customizable and default to 
-  being named with the $host_$database_$timestamp.{sql,err} format.
+    function __construct($help=NULL) { 
+      $this->help_docs = $help;
+      $this->args['debug'] = false;
+      $this->args['help'] = false;
+    }
+    public function parseArgs($argv){
+        $this->script_name = $argv[0];
+        array_shift($argv);
+        foreach ($argv as $arg){
+            // --foo --bar=baz
+            if (substr($arg,0,2) == '--'){
+                $eqPos = strpos($arg,'=');
+                // --foo
+                if ($eqPos === false){
+                    $key = substr($arg,2);
+                    if ($key === 'help') { $this->print_help(); exit(); }
+                    if (isset($this->args[$key])) {
+                      // The existance of a given/supplied parameter by default
+                      // means to turn it on . which is set it to true
+                      $this->args[$key] = true;
+                    } else {
+                        // If the arg was not created with add_option then bail
+                        $this->print_help($key);
+                        exit();
+                    }
+                }
+                // --bar=baz
+                else {
+                    $key                = substr($arg,2,$eqPos-2);
+                    $value              = substr($arg,$eqPos+1);
+                    $this->args[$key] = $value;
+                }
+            }
+            // plain-arg
+            else {
+                $this->print_help($arg);
+                exit();
+            }
+        }
+    }
+    public function print_help($bad='') {
+      if ($bad !== '') {
+        print "\nERROR:Invalid arguement " . $bad . "\n\n";
+      } else { 
+        print $this->help_docs;
+      }
 
-  For example: Here are two files that are output.
+      print "\n Sample command line : \n\n" . basename($this->script_name) . ' ';
+      foreach($this->args as $key => $value ) { 
+        if ($value) {
+          printf("--%s=%-s ", $key , $value? $value: 'off' );
+        }
+      }
+      print "\n\n\nCommand line options are:\n";
+      foreach($this->args as $key => $value ) printf("\t--%-15s ( %-s )\n", $key , $value? $value: 'off' );
+    }
+    public function add_option($option, $value=false) {
+      $this->args[$option] = $value;
+    }
+    public function set_help($help) {
+      $this->help_docs = $help;
+    }
+}
 
-    localhost_dentegra_dev_Jan_08_2013_5_05_57.sql
-    localhost_dentegra_dev_Jan_08_2013_5_05_57.err
+class CommandLineSettings extends CommandLine {
 
-  Command Line options:
+    public $settings_file = '';
+    public $store_option = array(); // Stores whether or not to save
+       // A command line option to the settings file or not.
 
-    // Options 
-     verbose   Print debugging output
-     tbx       Set the list of tables to exclude from the backup.   NOTE: The schemas are dumped but the actual data is not.
-               Here is the default list if this option is not specified:  sessions,accesslog,cache,cache_form,cache_apachesolr,cache_block,cache_content,cache_filter,cache_menu,cache_page,cache_update,history,search_index,search_dataset,search_total,search_node_links,webform_submitted_data,notifications,notifications_event,notifications_queue,notifications_fields,notifications_sent,watchdog');
+    function __construct($help=NULL) {
+      parent::__construct($help);
 
-     tb        A table to backup: Use this if you only need to create a backup of one file.
-     createdb  Include the "CREATE database" mysqlcommand in the output file. NOTE: Sometimes the rmuser does NOT have permission to do this.
-     dropdb    Include the "drop database" mysqlcommand in the output file. NOTE: Sometimes the rmuser does NOT have permission to do this.
-     latest    Create a sym link called latest in the storage directory. This is simply for convenience.
-     usedb     Include the "USE database" mysqlcommand in the output file. 
-     fkeys     Set the FOREIGN_KEY_CHECKS environment variable before the mysqldump command. 
-     no_ssh    For pantheon that doesn't allow ssh access you need to turn on this flag -- The assumption that is that mysqldumps will be done locally and stdout redirected to a file.
+      // By default setup save, load, and print for settings
+      $this->add_option('save', false, false);
+      $this->add_option('load', false, false);
+      $this->add_option('print', false, false);
+      $this->add_option('help', false, false);
+      $this->add_option('debug', false, false);
+    }
 
-    // Local Settings 
-     lmuser    local mysql username
-     lmpass    local mysql password to use
-     ldb       local database name
-     host'     hostname of the local host
-     storage   directory to store the database dumps in
-     lpulldir  directory to store the pulled database dumps in.
+    public function load_settings() {
+      $vals = file_get_contents($this->args['load']);
+      // Later over writes former
+      //                          defaults<--stored values
+      if ($vals) {
+        $this->args = array_merge($this->args, unserialize($vals));
+      } else { 
+        print "ERROR: Bad loaded file\n\n";
+        exit();
+      }
+    }
+    function ismake($dir) {
+      if (is_dir($dir)) {
+        return;
+      } else {
+          if (mkdir($dir, 0777, true)) {
+            return;
+          } else {
+            print "Couldn't create directory ". $dir;
+            exit();
+          }
+      }
+    }
+    public function save_settings() {
+      if (is_string($this->args['save'])) {
+        $base = dirname($this->args['save']) ;
+        $this->ismake($base);
 
-    // Remote Settings 
-     rmuser    Set the remote mysql username
-     rmpass    Set the remote mysql password
-     rdb
-     ruser     Set the remote ssh username
-     rhost     Set the remote hostname to ssh to.
-     rmhost    Set the remote hostname of the mysql server.
-     rstorage  Set the directory that ddbb will use to put it's database dumps in.
-     rpushdir  Set the directory that ddbb will push database dumps to.
-
-    // Commands 
-     lb       Perform a local backup
-     rb       Perform a remote backup
-     push     Push a local backup to the remote server and load the backup into the remote mysql server.
-     pull     Copy the remote backup from the remote server to the local server and load it into the mysql server.
-     s       Save all the options, local settings, and remote settings into a serialized array file with this name.  
-     l       Load all the saved options from this serialized array file.
-     p       Print out all the available options with an example.
-
-
-NOTES:
-
-* Before doing a push or pull both remote and local databases are backed up automatically for safety reasons.
-  Therefore you do not have to do lb or rb commands in addition to pushing and pulling..
-* 
-
-* All options need a double dash that should preceed them.
-
-* All option values need an equal sign infront of them. 
-
-* Commands do not take values.
-
-Typical usage:
-
-ddbb --l=dt.ddbb --lb      Load the settings from the dt.ddbb file and perform a local backup
-
-ddbb --l=dt.ddbb --rb      Load the settings from the dt.ddbb file and perform a remote backup
-
-ddbb --l=dt.ddbb --push    Load the settings from the dt.ddbb file and push the local database to remote database server.
-                            For example, if executed locally your local machine is your development machine 
-                            and your remote machine is your production machine then this would be pushing the database
-                            from your dev to your prod machine.
-
-ddbb --l=dt.ddbb --pull     Perform a local and remote backup, and then copy the remote backuped up database
-                            to your local machine and load that database dump into your local mysql server.
-
-
-ddbb --p                    Print all options with an example.   Here is a sample output of this command:
-
-
-
-*/
+        // remove unwanted values from being stored
+        $file = $this->args['save'];
+        foreach($this->store_option as $key => $value) {
+          if (!$this->store_option[$key]) {
+            unset($this->args[$key]);
+          }
+        }
+        $args = serialize($this->args);
+        file_put_contents($file, $args );
+      } else {
+        print 'Invalid save string filename\n';
+        exit();
+      }
+    }
+    public function add_option($option, $value, $type) {
+      parent::add_option($option, $value);
+      $this->store_option[$option] = $type;
+    }
+}
 
 class StopWatch { 
     public $total; 
@@ -227,6 +269,9 @@ class ddbb {
 
   public function processargs($argv) {
     // Options 
+
+      // add_option parameters:
+      // option, default value, whether to store it in settings file
     $this->cli->add_option( 'tbx', 'sessions,accesslog,cache,cache_form,cache_apachesolr,cache_block,cache_content,cache_filter,cache_menu,cache_page,cache_update,history,search_index,search_dataset,search_total,search_node_links,webform_submitted_data,notifications,notifications_event,notifications_queue,notifications_fields,notifications_sent,watchdog', true);
     $this->cli->add_option( 'tb', false, true );
     //$this->cli->add_option( 'createdb', false, true );
@@ -254,9 +299,11 @@ class ddbb {
     $this->cli->add_option( 'rstorage', '/home/dshumaker/backups/local', true );
     $this->cli->add_option( 'rpushdir', '/home/dan/backups/laptop/', true );
     $this->cli->add_option( 'no_ssh', false,true);
-    $this->cli->add_option( 'port', 3306,true); // Default port
+    $this->cli->add_option( 'mysql_port', 3306,true); // Default port
+    $this->cli->add_option( 'ssh_port', 22 ,true); // Default port
 
     // Commands 
+    $this->cli->add_option( 'lf', false, false); // Use this file for restores or backups
     $this->cli->add_option( 'lb', false, false );  // Local Backup
     $this->cli->add_option( 'rb', false, false );  // Remote Backup
     $this->cli->add_option( 'llp', false, false );   // Load Latest Pulled Remote Backup
@@ -282,8 +329,8 @@ class ddbb {
       $this->io->ismake($this->cli->args['storage']);
       $this->io->ismake($this->cli->args['lpulldir']);
       if (!$this->cli->args['no_ssh']) {
-        $this->io->cmd('ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rstorage'] );
-        $this->io->cmd('ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rpushdir'] );
+        $this->io->cmd('ssh -p ' . $this->cli->args['ssh_port'] . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rstorage'] );
+        $this->io->cmd('ssh -p ' . $this->cli->args['ssh_port'] . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' mkdir -p ' . $this->cli->args['rpushdir'] );
       }
       $this->cli->save_settings();
       $this->cli->print_help();
@@ -296,11 +343,18 @@ class ddbb {
     }
 
     if ($this->cli->args['lb']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
       $this->backup();
+      $this->io->pt();
+      exit();
     }
 
     if ($this->cli->args['rb']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
       $this->backup(TRUE);
+      $this->io->pt();
     }
 
     if ($this->cli->args['push']) {
@@ -316,11 +370,11 @@ class ddbb {
       }
       if (file_exists($latest)) {
         if (!$this->cli->args['no_ssh']) {
-          $scp = 'scp '  . $latest . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'].':' . $this->cli->args['rpushdir'];
+          $scp = 'scp -P ' . $this->cli->args['ssh_port'] . ' ' . $latest . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'].':' . $this->cli->args['rpushdir'];
           $this->io->cmd($scp);
-          $pushit = 'ssh ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' "mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' ' . $this->cli->args['rdb'] . ' < ' . $this->cli->args['rpushdir'] .'/'. basename($latest) . '"';
+          $pushit = 'ssh -p ' . $this->cli->args['ssh_port'] . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ' "mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' ' . $this->cli->args['rdb'] . ' < ' . $this->cli->args['rpushdir'] .'/'. basename($latest) . '"';
         } else {
-          $pushit = 'mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'] . ' ' .  $this->cli->args['rdb'] . ' < ' . $latest ;
+          $pushit = 'mysql -u ' . $this->cli->args['rmuser'] . ' -p' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['mysql_port'] . ' ' .  $this->cli->args['rdb'] . ' < ' . $latest ;
         }
         $this->io->cmd($pushit);
         $this->io->pt();
@@ -333,19 +387,40 @@ class ddbb {
     }
     if ($this->cli->args['pull']) {
       $this->io->timing = true;
+      $this->io->ismake($this->cli->args['lpulldir']);
       $this->io->pt(1);
       $this->backup(); //local
       $this->backup(TRUE); //remote
       $this->loadlatest('pull');
     }
 
-		if ($this->cli->args['llp']) {
+    if ($this->cli->args['llp']) {
       $this->loadlatest('pull');
     }
-		if ($this->cli->args['lll']) {
+    if ($this->cli->args['lll']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
       $this->loadlatest('local');
+      $this->io->pt();
+    }
+    if ($this->cli->args['lf']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      $this->loadfile($this->cli->args['lf']);
+      $this->io->pt();
     }
 
+  }
+
+  public function loadfile($source) {
+      chdir($this->cli->args['storage']);
+      $this->io->cmd('tar -xvzf ' . $source);
+      $source = substr($source,0, -7);
+      $dropit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' -e "DROP DATABASE ' . $this->cli->args['ldb'] . ';CREATE DATABASE ' . $this->cli->args['ldb'] . '"';
+      $this->io->cmd($dropit);
+      $pullit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' ' . $this->cli->args['ldb'] . ' < ' . $this->cli->args['storage'] . '/' . $source ;
+      $this->io->cmd($pullit);
+      $this->io->pt();
   }
 
   /*
@@ -367,6 +442,8 @@ class ddbb {
         $sql = readlink('latest');
         $this->io->cmd('tar -xvzf ' . $sql);
         $source = substr($sql,0, -7);
+        $dropit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' -e "DROP DATABASE ' . $this->cli->args['ldb'] . ';CREATE DATABASE ' . $this->cli->args['ldb'] . '"';
+        $this->io->cmd($dropit);
         $pullit = 'mysql -u ' . $this->cli->args['lmuser'] . ' -p"' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'] . ' ' . $this->cli->args['ldb'] . ' < ' . $srcDir . '/' . $source ;
         $this->io->cmd($pullit);
         $this->io->cmd('rm '.  $source);
@@ -393,8 +470,12 @@ class ddbb {
         $dest = $this->cli->args['rstorage'];
       }
       $err = $dest .'/'. $this->cli->args['rmhost'] . '_' . $this->cli->args['rdb'] . '_' .$dt . '.err';
-      $sql_file = $dest .'/'. $this->cli->args['rmhost'] . '_' . $this->cli->args['rdb'] . '_' .$dt . '.sql';
-      $ssh = 'ssh '. $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'];
+      if ($this->cli->args['lf']) {
+        $sql_file = $dest .'/'. $this->cli->args['lf'];
+      } else {
+        $sql_file = $dest .'/'. $this->cli->args['rmhost'] . '_' . $this->cli->args['rdb'] . '_' .$dt . '.sql';
+      }
+      $ssh = 'ssh -p ' . $this->cli->args['ssh_port'] . ' '. $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'];
       if ($this->cli->args['fkeys']) {
         $fkeys = 'echo \"SET FOREIGN_KEY_CHECKS=0;\" > ' . $sql_file . ';';
       } else {
@@ -402,7 +483,7 @@ class ddbb {
       }
 
       if ($this->cli->args['no_ssh']) {
-        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'];
+        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['mysql_port'];
       } else {
         $start = $ssh . ' "' . $fkeys . 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=\"' . $this->cli->args['rmpass'] . '\" --host=' . $this->cli->args['rmhost'];
       }
@@ -411,7 +492,11 @@ class ddbb {
       $dest = $this->cli->args['storage'];
       $start = 'mysqldump --user=' . $this->cli->args['lmuser'] . ' --password="' . $this->cli->args['lmpass'] . '" --host=' . $this->cli->args['host'];
       $err = $dest .'/'. $this->cli->args['host'] . '_' . $this->cli->args['ldb'] . '_' .$dt . '.err';
-      $sql_file = $dest .'/'. $this->cli->args['host'] . '_' . $this->cli->args['ldb'] . '_' .$dt . '.sql';
+      if ($this->cli->args['lf']) {
+        $sql_file = $dest .'/'. $this->cli->args['lf'];
+      } else {
+        $sql_file = $dest .'/'. $this->cli->args['host'] . '_' . $this->cli->args['ldb'] . '_' .$dt . '.sql';
+      }
       $db_tab = $this->cli->args['ldb'];
     }
 
@@ -514,7 +599,7 @@ class ddbb {
       if (!$this->cli->args['no_ssh']) {
         $start = $ssh . ' "mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=\"' . $this->cli->args['rmpass'] . '\" --host=' . $this->cli->args['rmhost'];
       } else {
-        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['port'];
+        $start = 'mysqldump --user=' . $this->cli->args['rmuser'] . ' --password=' . $this->cli->args['rmpass'] . ' --host=' . $this->cli->args['rmhost'] . ' -P ' . $this->cli->args['mysql_port'];
       }
     }
 
@@ -540,16 +625,16 @@ class ddbb {
       $this->io->cmd($cmd);
 
       if (!$this->cli->args['no_ssh']) {
-        $this->io->cmd('scp ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ':' . $sql_file . ' ' . $this->cli->args['lpulldir']);
+        // Gzip
+        if ($this->cli->args['gzip'] && !$this->cli->args['debug']) {
+          $cmd = $ssh .  ' "cd ' . $this->cli->args['rstorage'] . ';tar -cvzf ' . basename($sql_file) .'.tar.gz ' . basename($sql_file) . '"';
+          $this->io->cmd($cmd);
+          //$this->io->cmd('rm ' . basename($sql_file));
+          $sql_file = $sql_file . '.tar.gz';
+        }
+        $this->io->cmd('scp -P ' . $this->cli->args['ssh_port'] . ' ' . $this->cli->args['ruser'] . '@' . $this->cli->args['rhost'] . ':' . $sql_file . ' ' . $this->cli->args['lpulldir']);
       } 
       chdir($this->cli->args['lpulldir']);
-      // Gzip
-      if ($this->cli->args['gzip'] && !$this->cli->args['debug']) {
-        $cmd = 'tar -cvzf ' . basename($sql_file) .'.tar.gz ' . basename($sql_file);
-        $this->io->cmd($cmd);
-        $this->io->cmd('rm ' . basename($sql_file));
-        $sql_file = $sql_file . '.tar.gz';
-      }
       if ($this->cli->args['latest']) {
         if (is_link('latest')) {
           unlink('latest'); 
